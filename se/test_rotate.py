@@ -204,7 +204,17 @@ def main():
     # --- the gate must be able to fail, or it is not a gate ---
     folded = fold_rmsnorm_gains(build_model(d, tied=False, seed=1)[0])
     broken = copy.deepcopy(folded)
-    broken.model.layers[1].self_attn.q_proj.weight.data += 0.05
+    # Perturb every layer's q_proj, not just one. A single-layer nudge is only ~2.5x that
+    # layer's own weight std under the real Qwen3 init (initializer_range=0.02) — small enough
+    # that q_norm and the downstream residual-stream norms damp it out before it reaches the
+    # well-separated ("decided") logits, even though it still corrupts the near-tied ones and
+    # fails the aggregate KL/top-1 gate. mini_qwen3's from-scratch init is ~3.6x larger in std,
+    # so the same constant reads as a bigger relative perturbation there — the fixture silently
+    # depended on which backend built it. A real construction bug (missed gain fold, transposed
+    # convention, tied embedding) corrupts every layer, not one, so spreading the perturbation
+    # matches what it's meant to simulate and is robust across both backends.
+    for layer in broken.model.layers:
+        layer.self_attn.q_proj.weight.data += 0.05
     rep = invariance_gate(folded, broken, _StubTokenizer(), ["x"] * 4, max_length=16, batch_size=2)
     print("\ngate sensitivity")
     all_ok &= check("gate fails on a perturbed model", not rep["passed"],
