@@ -358,6 +358,117 @@ def invariance_gate(model_ref, model_rot, tokenizer, texts, max_length=512, batc
     return report
 
 
+@torch.no_grad()
+def disagreement_profile(model_ref, model_rot, tokenizer, texts, max_length=512,
+                         batch_size=2, confident_gap=1.0,
+                         gap_edges=(0.0, 0.05, 0.25, 1.0, 4.0, float("inf"))):
+    """Where do the top-1 flips sit — on ties, or on decided predictions?
+
+    `invariance_gate` reports one agreement number, and that number cannot tell a
+    rounding artifact from a broken fold. This can.
+
+    For every token it takes the *reference's* top-1 minus top-2 logit gap — how decided
+    that prediction was before anything was touched — and buckets the flips by it.
+    Re-rounding perturbs logits by a bounded amount, so it can only flip a prediction
+    whose gap was already inside that amount. The signature is: flips pile up in the
+    gap ~ 0 bin, the reference's top-1 is still the rotated model's *second* choice when
+    it does flip, and agreement on decided tokens (gap > `confident_gap`) is 1.
+
+    A real construction bug — a missed gain fold, a transposed [vocab, d] convention, an
+    unnoticed tied embedding — perturbs logits by O(1) or worse and therefore flips
+    decided tokens too. That is what this separates out, and it is the thing the raw
+    agreement number cannot do, because a bad-enough tie distribution and a mild bug
+    produce the same scalar.
+    """
+    edges = list(gap_edges)
+    n_bins = len(edges) - 1
+    bin_tokens, bin_flips = [0] * n_bins, [0] * n_bins
+    gaps_at_flip = []
+    n_tokens = n_flips = flips_still_rank2 = 0
+    conf_tokens = conf_flips = 0
+
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
+        enc = tokenizer(batch, return_tensors="pt", padding="max_length", truncation=True,
+                        max_length=max_length)
+        m = enc["attention_mask"].bool()
+
+        lr = model_ref(**{k: v.to(model_ref.device) for k, v in enc.items()}).logits.float()
+        lq = model_rot(**{k: v.to(model_rot.device) for k, v in enc.items()}).logits.float()
+        lq = lq.to(lr.device)
+        mm = m.to(lr.device)
+
+        top2_r = lr.topk(2, dim=-1)
+        top2_q = lq.topk(2, dim=-1)
+
+        gap = (top2_r.values[..., 0] - top2_r.values[..., 1])[mm]      # [n]
+        ref_top1 = top2_r.indices[..., 0][mm]
+        q_top1 = top2_q.indices[..., 0][mm]
+        q_top2 = top2_q.indices[..., 1][mm]
+
+        flip = ref_top1 != q_top1
+        n_tokens += int(gap.numel())
+        n_flips += int(flip.sum().item())
+        flips_still_rank2 += int((flip & (ref_top1 == q_top2)).sum().item())
+        gaps_at_flip.append(gap[flip].cpu())
+
+        conf = gap > confident_gap
+        conf_tokens += int(conf.sum().item())
+        conf_flips += int((conf & flip).sum().item())
+
+        for b in range(n_bins):
+            in_bin = (gap >= edges[b]) & (gap < edges[b + 1])
+            bin_tokens[b] += int(in_bin.sum().item())
+            bin_flips[b] += int((in_bin & flip).sum().item())
+
+        del lr, lq, top2_r, top2_q, gap, ref_top1, q_top1, q_top2, flip
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    gaps_at_flip = (torch.cat(gaps_at_flip) if gaps_at_flip else torch.zeros(0))
+    return {
+        "n_tokens": n_tokens,
+        "n_flips": n_flips,
+        "top1_agreement": 1.0 - n_flips / max(n_tokens, 1),
+        "confident_gap": confident_gap,
+        "n_confident_tokens": conf_tokens,
+        "n_confident_flips": conf_flips,
+        # NaN, not 1.0, when nothing was decided: an empty set has no disagreements in it, and
+        # a caller asserting `> 0.999` must not read that as a pass. NaN fails every comparison.
+        "confident_agreement": (1.0 - conf_flips / conf_tokens) if conf_tokens else float("nan"),
+        "flip_gap_median": float(gaps_at_flip.median()) if gaps_at_flip.numel() else 0.0,
+        "flip_gap_p90": (float(gaps_at_flip.quantile(0.9)) if gaps_at_flip.numel() else 0.0),
+        "flip_gap_max": float(gaps_at_flip.max()) if gaps_at_flip.numel() else 0.0,
+        "frac_flips_still_rank2": flips_still_rank2 / max(n_flips, 1),
+        "gap_edges": edges,
+        "bin_tokens": bin_tokens,
+        "bin_flips": bin_flips,
+    }
+
+
+def format_disagreement_profile(prof, title="disagreement profile"):
+    edges = prof["gap_edges"]
+    rows = []
+    for b, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
+        n, f = prof["bin_tokens"][b], prof["bin_flips"][b]
+        label = f"[{lo:g}, {hi:g})" if hi != float("inf") else f"[{lo:g}, inf)"
+        rows.append(f"    {label:>14} : {f:7d} / {n:7d} flipped"
+                    f"   = {(f / n if n else 0.0):.5f}")
+    return (
+        f"{title}\n"
+        f"  tokens / top-1 flips   : {prof['n_tokens']} / {prof['n_flips']} "
+        f"(agreement {prof['top1_agreement']:.5f})\n"
+        f"  flip ref top-2 gap     : median {prof['flip_gap_median']:.4f}, "
+        f"p90 {prof['flip_gap_p90']:.4f}, max {prof['flip_gap_max']:.4f}\n"
+        f"  flips where ref top-1 is still the rotated model's 2nd choice : "
+        f"{prof['frac_flips_still_rank2']:.5f}\n"
+        f"  agreement on decided tokens (gap > {prof['confident_gap']:g}) : "
+        f"{prof['confident_agreement']:.5f}  "
+        f"({prof['n_confident_flips']}/{prof['n_confident_tokens']} flipped)\n"
+        f"  flip rate by reference top-2 logit gap:\n" + "\n".join(rows)
+    )
+
+
 def gate_against_floor(report, floor_report, kl_ratio=3.0, top1_ratio=3.0,
                        kl_threshold=1e-4, top1_threshold=0.999):
     """Re-judge an invariance report against a measured quantization floor.

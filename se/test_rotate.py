@@ -24,6 +24,7 @@ from rotate import (  # noqa: E402
     apply_rotation,
     assert_no_residual_gains,
     compare_to_inverse,
+    disagreement_profile,
     fold_rmsnorm_gains,
     invariance_gate,
     random_orthogonal,
@@ -208,6 +209,36 @@ def main():
     print("\ngate sensitivity")
     all_ok &= check("gate fails on a perturbed model", not rep["passed"],
                     f"mean KL = {rep['mean_kl']:.2e}, top-1 = {rep['top1_agreement']:.3f}")
+
+    # --- the gap-resolved view NB01 asserts on, on the same two pairs ---------------
+    # NB01's gate A cannot assert on aggregate agreement: in bf16 that number is set by how
+    # many near-ties the reference had, so a correct fold and no fold at all land in the same
+    # band. It asserts on `confident_agreement` instead, which is 1 for anything rounding can
+    # do and collapses for a model that is actually wrong. Both halves are checked here.
+    # `confident_gap` is 0.05 rather than NB01's 1.0 because this fixture is randomly
+    # initialized: its logits are near-uniform and nothing in it is decided by a whole nat.
+    # The threshold has to sit inside the model's own gap distribution to mean anything, and
+    # a real LM's is orders wider. What is being tested is the discrimination, not the number.
+    rot_ok = apply_rotation(copy.deepcopy(folded), random_orthogonal(d, seed=1))
+    rot_prof = disagreement_profile(folded, rot_ok, _StubTokenizer(), ["x"] * 4,
+                                    max_length=16, batch_size=2, confident_gap=0.05)
+    bad_prof = disagreement_profile(folded, broken, _StubTokenizer(), ["x"] * 4,
+                                    max_length=16, batch_size=2, confident_gap=0.05)
+    empty_prof = disagreement_profile(folded, rot_ok, _StubTokenizer(), ["x"] * 4,
+                                      max_length=16, batch_size=2, confident_gap=1e9)
+    all_ok &= check("decided tokens survive the rotation exactly",
+                    rot_prof["confident_agreement"] == 1.0 and rot_prof["n_flips"] == 0,
+                    f"confident = {rot_prof['confident_agreement']:.5f}, "
+                    f"{rot_prof['n_flips']} flips in {rot_prof['n_tokens']} tokens")
+    all_ok &= check("decided tokens do not survive a perturbed model",
+                    bad_prof["confident_agreement"] < 0.999,
+                    f"confident = {bad_prof['confident_agreement']:.5f} on "
+                    f"{bad_prof['n_confident_tokens']} decided tokens")
+    # An empty decided set must not read as a pass — 0/0 is not agreement.
+    all_ok &= check("no decided tokens reads as NaN, not 1.0",
+                    empty_prof["n_confident_tokens"] == 0
+                    and not (empty_prof["confident_agreement"] > 0.999),
+                    f"confident = {empty_prof['confident_agreement']}")
 
     # --- non-orthogonal maps are refused: RMSNorm does not commute with them (§7.1) ---
     S = random_orthogonal_scaled(d, seed=7, log_scale=0.5)
