@@ -582,6 +582,19 @@ def make_collator(tokenizer, dtype=None):
 # training
 # ---------------------------------------------------------------------------
 
+def _warmup_kwarg(args_cls, ratio=0.03):
+    """`warmup_ratio` was folded into `warmup_steps` (a float < 1 now means a ratio of total
+    steps, same semantics) in newer transformers/trl; `TrainingArguments.__init__` and
+    `SFTConfig.__init__` raise TypeError on the old name there. se_env.py's floors are floors,
+    not pins, so an older install that still satisfies them may keep `warmup_ratio` as its own
+    field — detect which this install has rather than assuming one API generation.
+    """
+    import inspect
+
+    params = inspect.signature(args_cls.__init__).parameters
+    return {"warmup_ratio": ratio} if "warmup_ratio" in params else {"warmup_steps": ratio}
+
+
 def make_trainer_class(placeholder_id):
     from transformers import Trainer
 
@@ -663,12 +676,13 @@ def run_training(n_train, rotation, capacity, init, tokenizer, dataset=None,
             output_dir=save_dir, remove_unused_columns=False,
             per_device_train_batch_size=C.PER_DEVICE_TRAIN_BATCH_SIZE,
             gradient_accumulation_steps=C.GRADIENT_ACCUMULATION_STEPS,
-            learning_rate=C.LEARNING_RATE, lr_scheduler_type="cosine", warmup_ratio=0.03,
+            learning_rate=C.LEARNING_RATE, lr_scheduler_type="cosine",
             optim="paged_adamw_8bit",
             bf16=torch.cuda.is_bf16_supported(), fp16=not torch.cuda.is_bf16_supported(),
             gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False},
             eval_strategy="epoch", logging_steps=5, save_strategy="no",
             report_to="none", seed=seed, data_seed=seed,
+            **_warmup_kwarg(TrainingArguments),
         ),
         train_dataset=train_subset,
         eval_dataset=eval_dataset,
@@ -916,12 +930,13 @@ def run_ablation_training(n_train, tag, tokenizer, dataset, seed=C.SEED, resume=
             assistant_only_loss=True, packing=False,
             per_device_train_batch_size=C.PER_DEVICE_TRAIN_BATCH_SIZE,
             gradient_accumulation_steps=C.GRADIENT_ACCUMULATION_STEPS,
-            learning_rate=C.LEARNING_RATE, lr_scheduler_type="cosine", warmup_ratio=0.03,
+            learning_rate=C.LEARNING_RATE, lr_scheduler_type="cosine",
             optim="paged_adamw_8bit",
             bf16=torch.cuda.is_bf16_supported(), fp16=not torch.cuda.is_bf16_supported(),
             gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False},
             eval_strategy="epoch", logging_steps=5, save_strategy="no",
             report_to="none", seed=seed, data_seed=seed,
+            **_warmup_kwarg(SFTConfig),
         ),
         peft_config=LoraConfig(
             r=C.LORA_R, lora_alpha=C.LORA_R * 2, lora_dropout=0.05,
