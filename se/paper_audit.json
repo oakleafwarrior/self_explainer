@@ -1,0 +1,63 @@
+{
+  "source": "TransluceAI/introspective-interp @ main",
+  "audited_on": "2026-08-16",
+  "audit_of_record": "claude_plans/v2_revisions_claude.md, Appendix F",
+  "method": "Read from a checkout of the release. Frozen here rather than re-checked at notebook runtime: the pod needs no clone of the paper's repo, and the citations are file:line so a reader can verify them against the public release directly. To re-verify, see reverify below.",
+  "findings": [
+    {
+      "id": "F.1",
+      "claim": "The activation-patching task uses no projector, on either side.",
+      "evidence": [
+        "config/act_patch/{base_base,base_qwen,qwen_base,qwen_qwen}_act_patch_cf.yaml — all four omit use_embed_proj",
+        "train.py:76 — use_embed_proj=config.get(\"use_embed_proj\", False)",
+        "model/utils.py:116 — passes that value explicitly, overriding ContinuousQwen's class default of True (model/continuous_qwen.py:25; ContinuousLlama defaults False at model/continuous_llama.py:22)",
+        "model/continuous_base.py:120 — builds projectors only if use_embed_proj or subject_embed_dim != hidden_size; Qwen3-8B and Llama-3.1-8B are both 4096, so the fallback never fires"
+      ],
+      "consequence": "embed_projs = None for all four patching configs. The activation is injected raw, so Tables 2 and 5 are symmetric — any critique alleging projector asymmetry between the self and cross explainers is wrong. C0 is therefore the paper's own configuration, not a strawman rung: it cannot represent Q^-1, and that is a fact about the paper's setup rather than an artifact of ours.",
+      "sets_arm": "C0"
+    },
+    {
+      "id": "F.2",
+      "claim": "A pretrained Qwen projector exists; the paper says it does not.",
+      "evidence": [
+        "config/feature_descriptions/qwen_131k.yaml — use_embed_proj: true, embed_proj_path: .../alignment_outputs/qwen_llama_3.1_8b_base/final_alignment_model.pt, output_dir: .../checkpoints/aligned_qwen_pretrained, peft_lora: false",
+        "config/feature_descriptions/qwen_131k_nonpretrainedembed.yaml — same but no embed_proj_path, output_dir: .../checkpoints/nonaligned_qwen",
+        "qwen_131k_simcor.yaml (peft_lora: false), qwen_131k_ood_fw.yaml and qwen_131k_ood_diff.yaml (peft_lora: true) — all use_embed_proj: true, none with embed_proj_path"
+      ],
+      "consequence": "The paper's §3.1 claim that pretrained projections were included only for Llama-3.1-70B is contradicted: both Qwen conditions were trained. Which one Table 1 reports is ambiguous, and the row may mix conditions across columns — differing both in projector init and in peft_lora. So the most direct test of basis compatibility (same explainer, same target, same data, alignment the only variable) was configured and never reported.",
+      "sets_arm": "P-rand vs P-ridge (NB05, §7.4)"
+    },
+    {
+      "id": "F.3",
+      "claim": "Projectors are LoRA target modules, not full-rank.",
+      "evidence": [
+        "model/utils.py:252-253 — for each trainable projector, target_modules.append(f\"embed_projs.{i}\")",
+        "model/utils.py:255-261 — LoraConfig constructed there; configs set lora_r: 128",
+        "model/continuous_base.py:138 — requires_grad_(True) on the projectors",
+        "model/continuous_peft.py:94 — projector weights saved alongside adapter weights"
+      ],
+      "consequence": "Under LoRA a projector is frozen-at-init plus a rank-128 update. The paper's footnote 7 states this accurately. At d=4096 that cannot represent an arbitrary orthogonal map. C128 exists to measure that cap, and it is also the failure mode our own Cfull degrades to if the input map is ever routed through PEFT — which is why se_common asserts the input map's parameter count on every run and se/test_input_map.py proves the assertion can fail.",
+      "sets_arm": "C128"
+    },
+    {
+      "id": "F.4",
+      "claim": "No alignment-training code shipped with the release.",
+      "evidence": [
+        "model/utils.py:121-156 — only the loading path exists, consuming LinearAlignmentModule state dicts keyed alignments.{layer}.weight",
+        "the .pt artifacts referenced by embed_proj_path are not public"
+      ],
+      "consequence": "The pretrained-projector condition is not directly reproducible from the release, so the ridge fit in NB05 is ours to write — but the loader documents the expected format, so emit state dicts in that shape.",
+      "sets_arm": "P-ridge (NB05)"
+    }
+  ],
+  "reverify": {
+    "note": "Not needed to run this project. If a reviewer wants the checks re-run, clone the release anywhere outside this repo and run these against it — nothing here reads the clone.",
+    "commands": [
+      "grep -L use_embed_proj config/act_patch/*.yaml            # F.1: expect all four listed",
+      "grep -n 'use_embed_proj' train.py model/utils.py model/continuous_base.py",
+      "grep -rn 'lora_r:' config/ | sort -u                       # F.3: expect 128",
+      "grep -n 'embed_projs' model/utils.py                       # F.3: the target_modules append",
+      "grep -n 'embed_proj_path\\|output_dir' config/feature_descriptions/qwen_131k*.yaml   # F.2"
+    ]
+  }
+}
