@@ -83,6 +83,40 @@ def check(name, ok, detail=""):
     return bool(ok)
 
 
+def rmsnorm_normalizes_in_float32(model):
+    """Does this model's RMSNorm cast to float32 no matter what dtype the model is?
+
+    transformers' `Qwen3RMSNorm.forward` does — `hidden_states.to(torch.float32)`, then
+    normalize, then cast back — and that bounds how exactly rotation invariance can hold,
+    independently of anything in rotate.py.
+
+    RMSNorm is invariant to an orthogonal `Q` because ||Qh|| = ||h||, but **rounding does not
+    commute with rotation**: `h` and `Qh` are different numbers, so they round differently, and
+    a float32 rounding step leaves a residue of order float32 eps (1.2e-7) that no correctness
+    in the fold or the rotation can remove. Measured directly: RMS(Qh) vs Q·RMS(h) differs by
+    7e-7 with the cast and 3e-15 without it, at d=64.
+
+    This is also why "folding preserves logits" passes at 1e-16 while "rotation preserves
+    logits" does not. Folding is a diagonal rescale of the weights and does not change the
+    value entering the norm, so its float32 rounding error is common-mode and cancels exactly
+    in the difference. Rotation changes that value from `h` to `Qh`, so it does not.
+
+    Detected rather than assumed, so the tolerance tracks the installed transformers instead of
+    the one that was current when this was written. Probe: perturb an input by 1e-10 at 1.0,
+    which is far below float32 resolution there (spacing 1.2e-7). A float32 normalizer rounds
+    the perturbation away and returns a bit-identical result; a dtype-faithful one does not.
+    """
+    for mod in model.modules():
+        if "RMSNorm" not in type(mod).__name__:
+            continue
+        h = torch.ones(1, mod.weight.shape[-1], dtype=torch.float64)
+        perturbed = h.clone()
+        perturbed[0, 0] += 1e-10
+        with torch.no_grad():
+            return (mod(h) - mod(perturbed)).abs().max().item() == 0.0
+    return False
+
+
 def main():
     all_ok = True
     d = 64
@@ -98,6 +132,15 @@ def main():
     for tied in (False, True):
         model, backend = build_model(d, tied)
         print(f"\n{backend}, tie_word_embeddings={tied}")
+
+        # The rotation checks below are exact algebra in exact arithmetic, so their tolerance is
+        # set by the coarsest rounding step in the forward pass — which is the norm, not the
+        # model dtype. See rmsnorm_normalizes_in_float32 for why rotation is affected and
+        # folding is not.
+        f32_norm = rmsnorm_normalizes_in_float32(model)
+        rot_tol, hidden_tol = (1e-5, 1e-6) if f32_norm else (1e-12, 1e-12)
+        print(f"  RMSNorm normalizes in {'float32 (transformers casts)' if f32_norm else 'the model dtype'}"
+              f" — rotation tolerance {rot_tol:.0e}")
 
         with torch.no_grad():
             ref_logits = model(ids).logits
@@ -123,6 +166,8 @@ def main():
         with torch.no_grad():
             fold_logits = folded(ids).logits
         err = (ref_logits - fold_logits).abs().max().item()
+        # stays tight under both norm regimes: folding does not change the value entering the
+        # norm, so any float32 rounding there is identical on both sides and cancels
         all_ok &= check("folding preserves logits", err < 1e-8, f"max |delta| = {err:.2e}")
 
         # --- §5.2: folding + Q leaves the function identical ---
@@ -131,15 +176,16 @@ def main():
             rot_out = rotated(ids, output_hidden_states=True)
             fold_out = folded(ids, output_hidden_states=True)
         err = (ref_logits - rot_out.logits).abs().max().item()
-        all_ok &= check("rotation preserves logits", err < 1e-7, f"max |delta| = {err:.2e}")
+        all_ok &= check("rotation preserves logits", err < rot_tol,
+                        f"max |delta| = {err:.2e} (tol {rot_tol:.0e})")
 
         # --- but the residual stream really did move, and moved by exactly Q ---
         h_ref, h_rot = fold_out.hidden_states[2], rot_out.hidden_states[2]
         moved = (h_ref - h_rot).abs().max().item()
         matched = (h_rot - h_ref @ Q.T).abs().max().item()
         all_ok &= check("hidden states moved", moved > 1e-3, f"max |delta| = {moved:.2e}")
-        all_ok &= check("hidden states equal Q h", matched < 1e-7,
-                        f"max |h_rot - Q h| = {matched:.2e}")
+        all_ok &= check("hidden states equal Q h", matched < hidden_tol,
+                        f"max |h_rot - Q h| = {matched:.2e} (tol {hidden_tol:.0e})")
 
         # --- the gain fold is load-bearing: rotating without it must be refused ---
         try:

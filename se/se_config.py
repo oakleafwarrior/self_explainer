@@ -30,7 +30,15 @@ except ImportError:                      # imported as a package rather than fla
     from .se_env import persistent_root
 
 PERSIST_ROOT = persistent_root()
-SE_ROOT = os.environ.get("SE_ROOT", f"{PERSIST_ROOT}/explanations_interp/self_explainer")
+
+# `<volume>/self_explainer`, which on a pod is the same directory the repo is cloned into. That
+# is deliberate — one folder on the volume holds the code and everything it produces — but it
+# means the four output directories below land inside the git working tree, so .gitignore
+# excludes them by name. Do not rename them here without renaming them there.
+#
+# (Was `<volume>/explanations_interp/self_explainer`. The extra level was a namespace inherited
+# from the earlier project and grouped nothing.)
+SE_ROOT = os.environ.get("SE_ROOT", f"{PERSIST_ROOT}/self_explainer")
 
 ROTATION_DIR = f"{SE_ROOT}/rotation"          # Q, folded/rotated weights, gate reports
 RUNS_DIR = f"{SE_ROOT}/runs"                  # one subdir per (task, rotation, capacity, init, n_train)

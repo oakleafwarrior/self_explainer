@@ -1,1 +1,13 @@
 2511.08579v3.pdf
+
+# On a pod SE_ROOT is <volume>/self_explainer — the same directory this repo is cloned into,
+# so se_config's four output trees appear inside the working tree. Anchored with a leading
+# slash so a future se/reports or notebooks/figures is not swept up by accident.
+/rotation/
+/runs/
+/figures/
+/reports/
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

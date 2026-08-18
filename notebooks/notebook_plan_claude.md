@@ -214,7 +214,8 @@ notebooks call in their first two cells.
 **Everything writes to the volume.** `se_env.persistent_root()` resolves `/workspace` (GPU
 pod), `/runpod-volume` (serverless), or `$SE_PERSIST_ROOT`, and falls back to `~` off-RunPod so
 the CPU-only notebooks run on a laptop. Outputs land in
-`<volume>/explanations_interp/self_explainer`, the HF cache in `<volume>/hf_cache`.
+`<volume>/self_explainer` — the same directory the repo is cloned into on a pod, so the four
+output trees are .gitignore'd — and the HF cache in `<volume>/hf_cache`.
 
 All of these are optional:
 
@@ -223,7 +224,7 @@ All of these are optional:
 | `HF_TOKEN` | — | pod-template environment variable; `<volume>/.hf_token` works too |
 | `SE_REPO_DIR` | `/workspace/self_explainer` | where this repo is checked out |
 | `SE_PERSIST_ROOT` | `/workspace` | the volume everything is written under |
-| `SE_ROOT` | `<volume>/explanations_interp/self_explainer` | overrides the output tree outright |
+| `SE_ROOT` | `<volume>/self_explainer` | overrides the output tree outright |
 | `SE_PIN_GPU` | — | `0` restricts the process to one device on a multi-GPU pod |
 
 **One clone, and it is this repo.** Nothing reads `introspection_replication` or

@@ -410,3 +410,21 @@ measured floor rather than an absolute bar, and a floor of 0 makes "within one o
 magnitude" vacuous.
 
 Minor, same section: the markdown says 256 sequences; the code breaks at 64.
+
+**A second reason the fold-then-unfold null is the right one.** `test_rotate.py` on the pod
+reported `rotation preserves logits — max |delta| = 1.02e-07` in a **float64** model, nine orders
+above float64 roundoff. The cause is `Qwen3RMSNorm.forward`, which hard-casts to float32
+whatever the model dtype is. RMSNorm is invariant to an orthogonal `Q` because ‖Qh‖ = ‖h‖, but
+**rounding does not commute with rotation**: `h` and `Qh` are different numbers and round
+differently, so a float32 rounding step leaves a residue of order 1.2e-7. Measured directly at
+d=64: RMS(Qh) vs Q·RMS(h) differs by 7.2e-07 with the cast and 2.7e-15 without it. Folding is
+unaffected — it does not change the value entering the norm, so its rounding error is
+common-mode and cancels, which is exactly why "folding preserves logits" passed at 1.7e-16 in
+the same run.
+
+So M_Q carries an irreducible discrepancy from the rotation that is a property of the
+architecture, not of `rotate.py`. That is precisely what a fold-with-Q-then-unfold-with-Qᵀ null
+measures and what a same-model-against-itself comparison cannot see, and it is the number the
+1e-4 gate threshold should be calibrated against. Neither finding blocks anything on its own —
+the gate passed at mean KL 1.9e-08 against 1e-4 — but together they mean the gate currently has
+no calibrated floor *and* a real effect it was never sized for.
