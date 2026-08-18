@@ -358,15 +358,82 @@ def invariance_gate(model_ref, model_rot, tokenizer, texts, max_length=512, batc
     return report
 
 
-def format_gate_report(report, title="invariance gate"):
+def gate_against_floor(report, floor_report, kl_ratio=3.0, top1_ratio=3.0,
+                       kl_threshold=1e-4, top1_threshold=0.999):
+    """Re-judge an invariance report against a measured quantization floor.
+
+    `M ≡ M_Q` is exact in exact arithmetic, so every deviation the gate sees is arithmetic.
+    In bfloat16 that deviation is large and irreducible: `apply_rotation` computes `W Qᵀ` in
+    float64 and stores it back with `.to(w.dtype)`, so every weight is re-rounded to 8
+    mantissa bits *after* a dense mix of all `d` coordinates. On Qwen3-0.6B that alone puts
+    mean KL at ~1.2e-3, an order above the absolute 1e-4 bar, for reasons that are not bugs.
+    v2 §5.5 called this in advance: "a fixed 1e-4 threshold may be unreachable for reasons
+    that are not bugs."
+
+    `floor_report` supplies the scale. The right null is the *folded* model: folding is also
+    an exact identity in exact arithmetic, and it is re-rounded through the same path, but it
+    involves no change of basis. What it costs is what rewriting every weight costs. A
+    rotation that stays within a few multiples of that has not broken anything the arithmetic
+    had not broken already. Measured on the mini_qwen3 replica in bf16, fold-only is 6.9e-06
+    and fold+rotate is 1.3e-05 — a ratio of 1.9.
+
+    The bar never loosens below the absolute one — it is `max(absolute, ratio * floor)` — so
+    in float32, where the floor is ~3e-09, this reduces exactly to the original 1e-4 test.
+    One formula covers both regimes, and the failure it is meant to catch (a missed gain fold,
+    a transposed [vocab, d] convention, a tied embedding) lands orders above the floor rather
+    than a few multiples of it, so the relative form keeps the power the absolute one had.
+    """
+    floor_kl = float(floor_report["mean_kl"])
+    floor_disagree = 1.0 - float(floor_report["top1_agreement"])
+
+    kl_bar = max(kl_threshold, kl_ratio * floor_kl)
+    disagree_bar = max(1.0 - top1_threshold, top1_ratio * floor_disagree)
+
+    out = dict(report)
+    out["floor_mean_kl"] = floor_kl
+    out["floor_top1_agreement"] = float(floor_report["top1_agreement"])
+    out["kl_ratio_to_floor"] = (report["mean_kl"] / floor_kl) if floor_kl > 0 else float("inf")
+    out["kl_threshold"] = kl_bar
+    out["top1_threshold"] = 1.0 - disagree_bar
+    out["relative_to"] = "folded model (same re-rounding, no change of basis)"
+    out["passed"] = bool(
+        report["mean_kl"] <= kl_bar
+        and (1.0 - report["top1_agreement"]) <= disagree_bar
+    )
+    return out
+
+
+def format_gate_report(report, title="invariance gate", show_verdict=True):
+    """Render a gate report.
+
+    `show_verdict=False` prints the numbers without the accept bars or the PASS/FAIL line, for
+    a report being used as a *measurement* rather than a test — the folded model in bf16, whose
+    `passed` field is computed against an absolute threshold it is not being asked to meet.
+    Printing "FAIL — do not proceed" under a number that is doing its job is worse than
+    printing nothing.
+    """
+    floor = ""
+    if "floor_mean_kl" in report:
+        floor = (
+            f"  quantization floor     : {report['floor_mean_kl']:.3e} mean KL "
+            f"({report['relative_to']})\n"
+            f"  this run / floor       : {report['kl_ratio_to_floor']:.2f}x\n"
+        )
+    kl_accept = f"   (accept <= {report['kl_threshold']:.2e})" if show_verdict else ""
+    top1_accept = f"   (accept >= {report['top1_threshold']:.5f})" if show_verdict else ""
+    verdict = (
+        f"\n  VERDICT                : "
+        f"{'PASS' if report['passed'] else 'FAIL — do not proceed'}"
+    ) if show_verdict else ""
     return (
         f"{title}\n"
         f"  sequences / tokens     : {report['n_sequences']} / {report['n_tokens']}\n"
-        f"  mean per-token KL      : {report['mean_kl']:.3e}   (accept <= {report['kl_threshold']:.0e})\n"
+        + floor +
+        f"  mean per-token KL      : {report['mean_kl']:.3e}{kl_accept}\n"
         f"  max per-token KL       : {report['max_kl']:.3e}\n"
         f"  max |logit delta|      : {report['max_abs_logit_delta']:.3e}\n"
-        f"  top-1 agreement        : {report['top1_agreement']:.5f}   (accept >= {report['top1_threshold']})\n"
-        f"  VERDICT                : {'PASS' if report['passed'] else 'FAIL — do not proceed'}"
+        f"  top-1 agreement        : {report['top1_agreement']:.5f}{top1_accept}"
+        + verdict
     )
 
 
