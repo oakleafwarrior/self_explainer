@@ -247,6 +247,33 @@ def main():
                     f"aligned = {a_ang['angle_mean_deg']:.1f}deg, "
                     f"unrelated = {u_ang['angle_mean_deg']:.1f}deg")
 
+    # --- a CPU M against a model that is not on the CPU -------------------------
+    # Everything above runs on the CPU, where M and the weights agree on device by accident,
+    # so none of it can catch a device mismatch in apply_rotation. random_orthogonal always
+    # builds M on the CPU while NB01 puts the model on a GPU, so this is the one configuration
+    # the notebooks actually use and the tests never exercised. Skips where it cannot fail.
+    print("\ndevice parity (CPU M, non-CPU model)")
+    if not torch.cuda.is_available():
+        print("  (skipped — no CUDA visible; run this on the pod, it is the check that "
+              "catches a CPU M against a GPU model)")
+    else:
+        dev = torch.device("cuda:0")
+        gm, _ = build_model(d, tied=False)
+        gm_folded = fold_rmsnorm_gains(gm).to(dev).eval()
+        gm_ids = ids.to(dev)
+        with torch.no_grad():
+            gm_ref = gm_folded(gm_ids).logits
+        gm_Q = random_orthogonal(d, seed=1234)          # deliberately left on the CPU
+        gm_rot = apply_rotation(copy.deepcopy(gm_folded), gm_Q)
+        with torch.no_grad():
+            gm_out = gm_rot(gm_ids).logits
+        gm_tol = 1e-5 if rmsnorm_normalizes_in_float32(gm_folded) else 1e-12
+        gm_err = (gm_ref - gm_out).abs().max().item()
+        all_ok &= check("rotation works with M on a different device than the model",
+                        gm_err < gm_tol, f"max |delta| = {gm_err:.2e} (tol {gm_tol:.0e})")
+        all_ok &= check("the caller's M is not moved or mutated",
+                        gm_Q.device.type == "cpu", f"M is on {gm_Q.device}")
+
     print("\n" + ("ALL CHECKS PASSED" if all_ok else "SOME CHECKS FAILED"))
     return 0 if all_ok else 1
 

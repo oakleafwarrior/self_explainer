@@ -211,7 +211,9 @@ def apply_rotation(model, M, orthogonality_atol=1e-8):
 
     M = M.double()
     d = M.shape[0]
-    orthogonality_err = (M.T @ M - torch.eye(d, dtype=torch.float64)).abs().max().item()
+    orthogonality_err = (
+        M.T @ M - torch.eye(d, dtype=torch.float64, device=M.device)
+    ).abs().max().item()
     if orthogonality_err > orthogonality_atol:
         raise ValueError(
             f"M is not orthogonal (max |M^T M - I| = {orthogonality_err:.2e}). "
@@ -220,6 +222,17 @@ def apply_rotation(model, M, orthogonality_atol=1e-8):
             "apply the scaled map to cached activations only (see random_orthogonal_scaled)."
         )
     Minv = M.T
+
+    # `random_orthogonal` builds M on the CPU while the model may be anywhere, and under
+    # device_map="auto" an 8B model is sharded across devices, so the operand device is a
+    # per-weight question rather than a global one. One copy of M is cached per device touched;
+    # for a single-GPU pod that is exactly one extra d x d float64 tensor (128 MB at d=4096).
+    _per_device = {}
+
+    def _operands(device):
+        if device not in _per_device:
+            _per_device[device] = (M.to(device), Minv.to(device))
+        return _per_device[device]
 
     groups = qwen3_module_map(model)
     seen = set()
@@ -236,17 +249,20 @@ def apply_rotation(model, M, orthogonality_atol=1e-8):
         if not _once(lin):
             continue
         w = lin.weight.data
-        lin.weight.data = (w.double() @ Minv).to(w.dtype)
+        _, Minv_d = _operands(w.device)
+        lin.weight.data = (w.double() @ Minv_d).to(w.dtype)
 
     # write paths: output must land in the rotated frame -> W <- M W (and bias <- M b)
     for lin in groups["write"]:
         if not _once(lin):
             continue
         w = lin.weight.data
-        lin.weight.data = (M @ w.double()).to(w.dtype)
+        M_d, _ = _operands(w.device)
+        lin.weight.data = (M_d @ w.double()).to(w.dtype)
         if getattr(lin, "bias", None) is not None:
             b = lin.bias.data
-            lin.bias.data = (M @ b.double()).to(b.dtype)
+            M_b, _ = _operands(b.device)
+            lin.bias.data = (M_b @ b.double()).to(b.dtype)
 
     # embed_tokens rows are residual contributions: row <- M row, i.e. E <- E M^T
     # lm_head rows consume the residual:                              W_U <- W_U M^{-1}
@@ -257,10 +273,12 @@ def apply_rotation(model, M, orthogonality_atol=1e-8):
     emb = inner.embed_tokens
     if _once(emb):
         w = emb.weight.data
-        emb.weight.data = (w.double() @ M.T).to(w.dtype)
+        M_d, _ = _operands(w.device)
+        emb.weight.data = (w.double() @ M_d.T).to(w.dtype)
     if lm_head is not None and _once(lm_head):
         w = lm_head.weight.data
-        lm_head.weight.data = (w.double() @ Minv).to(w.dtype)
+        _, Minv_d = _operands(w.device)
+        lm_head.weight.data = (w.double() @ Minv_d).to(w.dtype)
 
     return model
 
