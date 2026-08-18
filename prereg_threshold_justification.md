@@ -423,8 +423,44 @@ common-mode and cancels, which is exactly why "folding preserves logits" passed 
 the same run.
 
 So M_Q carries an irreducible discrepancy from the rotation that is a property of the
-architecture, not of `rotate.py`. That is precisely what a fold-with-Q-then-unfold-with-Qᵀ null
-measures and what a same-model-against-itself comparison cannot see, and it is the number the
-1e-4 gate threshold should be calibrated against. Neither finding blocks anything on its own —
-the gate passed at mean KL 1.9e-08 against 1e-4 — but together they mean the gate currently has
-no calibrated floor *and* a real effect it was never sized for.
+architecture, not of `rotate.py`. It is the number the 1e-4 gate threshold should be calibrated
+against, and a same-model-against-itself comparison cannot see it.
+
+### 7.1 The floor is already being computed: the folded model
+
+NB01's debug gate on Qwen3-0.6B **fails** — mean KL 1.178e-03 against the 1e-4 threshold, top-1
+0.99467 against 0.999, max |logit delta| 2.438. This is not a construction bug. It is the
+outcome v2 §5.5 predicted in advance: *"Dense Q destroys whatever near-zero structure the
+weights had, so bf16 error will exceed the unrotated model's own — a fixed 1e-4 threshold may be
+unreachable for reasons that are not bugs."*
+
+NB01 loads the debug model at `dtype=torch.bfloat16`, which has 8 mantissa bits (eps 3.9e-3).
+`apply_rotation` computes `W Qᵀ` in float64 and stores it back with `.to(w.dtype)`, so every
+weight in the model is re-rounded to bf16 after a dense mix of all `d` coordinates. Measured on
+the mini_qwen3 replica (d=256, 3 layers), same construction at four precisions:
+
+| dtype | fold only | fold + rotate | top-1 | max abs logit delta |
+|---|---|---|---|---|
+| bfloat16 | 6.93e-06 | 1.34e-05 | 0.97266 | 3.1e-02 |
+| float16 | 1.00e-07 | 1.98e-07 | 1.00000 | 3.9e-03 |
+| float32 | 2.78e-09 | 7.36e-10 | 1.00000 | 2.1e-06 |
+| float64 | 0.00e+00 | 0.00e+00 | 1.00000 | 4.7e-10 |
+
+Three layers at d=256 already break the top-1 criterion in bf16; 0.6B has 28 layers at d=1024,
+and the errors compound. float32 clears the 1e-4 threshold by six orders.
+
+**The right null is the folded model, and NB01 already builds it.** Folding is an exact identity
+in exact arithmetic, just like the rotation, and it goes through the same re-round-to-bf16 path —
+so `KL(M, fold(M))` isolates the quantization cost of rewriting every weight, with no basis
+change involved. Gate the rotation against *that* rather than against an absolute:
+
+    KL(M, fold+rotate(M))  vs  KL(M, fold(M))     accept within ~2-3x
+
+In the table above that ratio is 1.9× in bf16 and the construction is known-good. This is
+strictly better than the fold-then-unfold null suggested above: it needs no extra model, it is
+already computed, and it separates "the rotation broke something" from "bf16 cannot represent a
+densely rotated weight matrix," which is the only distinction the gate was ever able to make.
+
+The absolute 1e-4 threshold remains correct for a float32 demonstration, which is how the
+*claim* of invariance should be evidenced. bf16 is a deployment constraint, not a statement
+about the mathematics.

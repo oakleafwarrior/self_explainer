@@ -109,7 +109,8 @@ def rmsnorm_normalizes_in_float32(model):
     for mod in model.modules():
         if "RMSNorm" not in type(mod).__name__:
             continue
-        h = torch.ones(1, mod.weight.shape[-1], dtype=torch.float64)
+        h = torch.ones(1, mod.weight.shape[-1], dtype=torch.float64,
+                       device=mod.weight.device)
         perturbed = h.clone()
         perturbed[0, 0] += 1e-10
         with torch.no_grad():
