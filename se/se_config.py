@@ -91,7 +91,7 @@ PAPER_SELF_CROSS_MARGIN = 0.640 - 0.541
 # reusable), so the grid is chosen for what the readings need rather than for overlap with
 # a finished sweep. v2 §3's seven points, all of them ours.
 
-N_TRAIN_VALUES = [128, 256, 512, 1024, 2048, 4096, 8192]   # v2 §3: the full sweep
+N_TRAIN_VALUES = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]   # v2 §3: the full sweep
 N_TRAIN_LADDER = [512, 8192]     # capacity ladder and secondary-arm N values (v2 §3, §7.2)
 
 # v2 §3 asked for "3 training seeds at N in {512, 8192} for every core arm; 1 seed elsewhere."
