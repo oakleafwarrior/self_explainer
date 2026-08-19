@@ -63,7 +63,7 @@ PAPER_AUDIT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pap
 ACT_DATASET = "Transluce/act_patch_qwen3_8b_counterfact"
 ABLATION_DATASET = "Transluce/input_ablation_qwen3_8b_mmlu_hint"
 
-ACT_DATASET_PREFIX = 10_000     # base repo maps only the first 10k shuffled rows; keep identical
+ACT_DATASET_PREFIX = 20_000     # base repo maps only the first 10k shuffled rows; keep identical
 
 # Held out from every run so N_TRAIN comparisons share an eval set.
 #
