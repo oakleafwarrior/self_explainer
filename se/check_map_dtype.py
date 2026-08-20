@@ -50,7 +50,7 @@ def load_adapter(run_dir):
     return None
 
 
-def report(run_dir):
+def report(run_dir, root=None):
     sd = load_adapter(run_dir)
     if sd is None:
         return None
@@ -60,7 +60,7 @@ def report(run_dir):
               f"({len(sd)} keys) — this arm has no trainable map")
         return None
 
-    print(f"  {os.path.relpath(run_dir, C.RUNS_DIR)}")
+    print(f"  {os.path.relpath(run_dir, root or C.RUNS_DIR)}")
     verdicts = []
     for k in sorted(keys):
         W = sd[k]
@@ -78,25 +78,29 @@ def report(run_dir):
 
 
 def main():
+    # Optional runs-style root, so this can be pointed at a quarantine tree to snapshot the
+    # evidence before the adapters are deleted to reclaim volume space.
+    root = sys.argv[1] if len(sys.argv) > 1 else C.RUNS_DIR
     print("saved input maps, as they came off the GPU")
+    print(f"root: {root}")
     print("=" * 78)
 
     any_found = False
     all_verdicts = {}
     for rot in ("Q", "identity"):
-        pattern = C.run_dir("patching", rot, "Cfull", "identity", "*")
+        pattern = C.run_dir("patching", rot, "Cfull", "identity", "*", root=root)
         dirs = sorted(glob.glob(pattern)) + sorted(glob.glob(pattern + "/seed_*"))
         dirs = [d for d in dirs if os.path.isdir(d)]
         print(f"\nrotation = {rot} ({C.ROTATION_LABEL[rot]}), capacity = Cfull, "
               f"{len(dirs)} run dir(s)")
         for d in dirs:
-            v = report(d)
+            v = report(d, root)
             if v:
                 any_found = True
                 all_verdicts.setdefault(rot, []).extend(v)
 
     if not any_found:
-        print("\nNo saved Cfull adapters found under", C.RUNS_DIR)
+        print("\nNo saved Cfull adapters found under", root)
         print("Check SE_ROOT, or point this at the volume the runs actually landed on.")
         return
 
