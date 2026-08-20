@@ -745,7 +745,9 @@ def run_training(n_train, rotation, capacity, init, tokenizer, dataset=None,
     )
     print(f"  input map: {map_audit['input_map_trainable_params']:,} trainable "
           f"(expected {map_audit['input_map_expected_params']:,}), "
-          f"{map_audit['input_map_frozen_params']:,} frozen, LoRA-wrapped: no")
+          f"{map_audit['input_map_frozen_params']:,} frozen (PEFT's modules_to_save "
+          f"keeps the original alongside its trainable copy), LoRA-wrapped: "
+          f"{map_audit['input_map_lora_wrapped'] or 'no'}")
 
     trainer = make_trainer_class(special_ids(tokenizer)["placeholder"])(
         model=model,
