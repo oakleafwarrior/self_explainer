@@ -36,6 +36,27 @@ def compute_dtype():
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
+# The input map runs in float32 while the explainer runs in `compute_dtype()`. Two
+# independent reasons, both measured rather than assumed (NB04 §1):
+#
+#   1. Exactness. `Oracle`/R-Q and `C0`/R-id are the same computation only if Pi is applied
+#      to the vector as stored. Casting v to bfloat16 *before* the map makes Oracle compute
+#      Q^T bf16(Qv) against C0's bf16(v): 82% of the 4096 coordinates differ, at a relative
+#      L2 error of 2.5e-3 -- larger than bf16 quantization itself. No tolerance on an
+#      end-to-end score can absorb that, because it perturbs training, not just eval.
+#   2. Trainability of `Cfull`. bfloat16 spacing at 1.0 is 2^-8 = 3.9e-3, and AdamW at
+#      lr=1e-4 produces updates of ~1e-4. An identity-initialized map's diagonal entries
+#      are therefore rounded straight back to 1.0 on every step and never move, while the
+#      off-diagonals (starting at 0.0, where bf16 has range to spare) move freely. The arm
+#      whose whole purpose is to represent Q^{-1} exactly would be optimizing under an
+#      arbitrary dtype-induced constraint, in a direction the rotation arm needs most.
+#
+# Cost is ~0.5 GB of VRAM for Cfull (4 x 4096^2 fp32, doubled by PEFT's modules_to_save
+# copy). The projected vector is cast to the embedding dtype in build_inputs_embeds, so
+# the explainer's own arithmetic is unchanged.
+MAP_DTYPE = torch.float32
+
+
 def load_tokenizer(model_id=C.EXPLAINER_MODEL_ID):
     from transformers import AutoTokenizer
 
@@ -187,6 +208,52 @@ def load_ready_dataset(rotation, root=None):
     return load_from_disk(path)
 
 
+def check_rotation_exactness(dataset_rot, dataset_id, M, n=256, tol=1e-5):
+    """Is the rotated dataset actually `M v` of the identity dataset, row for row?
+
+    The end-to-end `Oracle`/R-Q vs `C0`/R-id comparison in NB04 is two *training runs*, so
+    it cannot separate a wiring fault from ordinary run-to-run variance. This can: it is
+    the same algebra, in float64, on the stored vectors, with no model involved. It is the
+    check that actually falsifies the three suspects worth suspecting —
+
+        row misalignment        `.map` reordered rows, or the two arms were built from
+                                different shuffles of the base set
+        wrong or stale Q        the dataset on disk was rotated by a different Q than the
+                                one loaded now (a re-run of NB01 with a changed Q_SEED)
+        wrong orientation       M applied as M^T, which is self-consistent everywhere else
+                                and only shows up here
+
+    A failure here means everything downstream is contaminated. A pass means the data is
+    right and any score difference is training noise, which is a claim about tolerance
+    rather than about wiring.
+    """
+    k = min(n, len(dataset_rot), len(dataset_id))
+    v_id = torch.tensor(
+        [p["intervention_vector"] for p in dataset_id[:k]["patch_position"]], dtype=torch.float64
+    )
+    v_rot = torch.tensor(
+        [p["intervention_vector"] for p in dataset_rot[:k]["patch_position"]], dtype=torch.float64
+    )
+    Md = M.double()
+    resid = (v_rot - v_id @ Md.T).norm(dim=1) / v_id.norm(dim=1).clamp_min(1e-30)
+    # the round trip the Oracle arm actually performs, in the precision it will run in
+    back = (v_rot @ Md).to(MAP_DTYPE).double()
+    round_trip = (back - v_id).norm(dim=1) / v_id.norm(dim=1).clamp_min(1e-30)
+    orth = (Md @ Md.T - torch.eye(Md.shape[0], dtype=torch.float64)).abs().max().item()
+    chunks_agree = dataset_rot[:k]["chunk_id"] == dataset_id[:k]["chunk_id"]
+    out = {
+        "n_checked": k,
+        "max_rel_residual": resid.max().item(),
+        "max_rel_round_trip": round_trip.max().item(),
+        "max_orthogonality_error": orth,
+        "chunk_ids_aligned": bool(chunks_agree),
+        "tol": tol,
+    }
+    out["passed"] = (out["max_rel_residual"] <= tol and out["max_rel_round_trip"] <= tol
+                     and out["chunk_ids_aligned"])
+    return out
+
+
 # ---------------------------------------------------------------------------
 # the input map on v — this is the capacity ladder (§3)
 # ---------------------------------------------------------------------------
@@ -293,6 +360,14 @@ class ChunkInputMap(nn.Module):
         return None
 
     def forward(self, v, chunk_ids):
+        # Trainer's compute_loss context is a nullcontext on GPU (accelerate wraps only
+        # model.forward), so today this map already runs outside autocast -- but the map is
+        # called from three places and float32 here is a correctness requirement, not a
+        # preference. Pin it rather than depend on where it happens to be called from.
+        with torch.autocast(device_type=v.device.type, enabled=False):
+            return self._forward(v, chunk_ids)
+
+    def _forward(self, v, chunk_ids):
         if self.full is not None:
             dtype = self.full[0].weight.dtype
             out = v.new_empty(v.shape[0], self.d_explainer, dtype=dtype)
@@ -554,7 +629,9 @@ def make_tokenize_fn(tokenizer):
 
 
 def make_collator(tokenizer, dtype=None):
-    dtype = dtype or compute_dtype()
+    # MAP_DTYPE, not compute_dtype: the vector is quantized once, on the far side of the
+    # input map, in build_inputs_embeds. Quantizing it here would quantize Pi's *input*.
+    dtype = dtype or MAP_DTYPE
 
     def collate(features):
         input_ids = torch.nn.utils.rnn.pad_sequence(
@@ -649,7 +726,7 @@ def run_training(n_train, rotation, capacity, init, tokenizer, dataset=None,
 
     input_map = build_input_map(capacity, init, d_target, d_explainer,
                                 ridge_matrices=ridge_matrices, seed=seed)
-    input_map.to(base_model.device, dtype=compute_dtype())
+    input_map.to(base_model.device, dtype=MAP_DTYPE)
     base_model.input_map = input_map
 
     peft_config = LoraConfig(
@@ -756,7 +833,7 @@ def eval_run(n_train, rotation, capacity, init, tokenizer, dataset=None, ridge_m
     d_target = d_target or _target_hidden_size()
     base_model.input_map = build_input_map(
         capacity, init, d_target, d_explainer, ridge_matrices=ridge_matrices, seed=seed
-    ).to(base_model.device, dtype=compute_dtype())
+    ).to(base_model.device, dtype=MAP_DTYPE)
 
     model = PeftModel.from_pretrained(base_model, save_dir) if n_train is not None else base_model
     model.eval()
@@ -774,7 +851,7 @@ def eval_run(n_train, rotation, capacity, init, tokenizer, dataset=None, ridge_m
         ]
         inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
         vectors = torch.tensor(
-            [p["intervention_vector"] for p in batch["patch_position"]], dtype=compute_dtype()
+            [p["intervention_vector"] for p in batch["patch_position"]], dtype=MAP_DTYPE
         ).to(model.device)
         chunk_ids = torch.tensor(batch["chunk_id"], dtype=torch.long).to(model.device)
 
