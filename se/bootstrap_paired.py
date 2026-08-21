@@ -224,6 +224,61 @@ PAIRS = {
 }
 
 
+def audit_eval_sets(root):
+    """Fingerprint every run's eval set and group runs that share one.
+
+    `eval_run` takes the eval split as the *last* EVAL_SIZE rows of the ready dataset
+    (se_common.py:831, `select(range(len(dataset) - C.EVAL_SIZE, len(dataset)))`). That
+    split is positional, so it moves wholesale when the dataset length changes -- and
+    ACT_DATASET_PREFIX went 10_000 -> 20_000 partway through this project. A run cached
+    before that rebuild holds a *disjoint* eval set from one cached after it, and
+    `run_training`/`eval_run` skip on "already done" rather than noticing.
+
+    Scores from two different groups are not comparable at all: not paired, not even
+    measuring the same items. `collect()` catches it for a pair being bootstrapped; this
+    catches it for the whole tree, including comparisons made by eye across NB03's tables.
+
+    Prints one line per group with its runs, so a stale group can be deleted and re-run.
+    """
+    import glob
+    from collections import defaultdict
+    import hashlib
+
+    groups = defaultdict(list)
+    for p in sorted(glob.glob(f"{root}/**/eval_records.json", recursive=True)):
+        with open(p) as f:
+            recs = json.load(f)
+        h = hashlib.sha1("\x00".join(r["target_text"] for r in recs).encode()).hexdigest()[:10]
+        groups[(h, len(recs))].append((os.path.relpath(os.path.dirname(p), root),
+                                       os.path.getmtime(p)))
+
+    print(f"EVAL-SET AUDIT — {root}")
+    print("=" * 96)
+    if not groups:
+        print("  no eval_records.json found")
+        return True
+    order = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+    total = sum(len(v) for v in groups.values())
+    print(f"  {total} runs, {len(groups)} distinct eval set(s)\n")
+    import datetime as _dt
+    for rank, ((h, n_items), runs) in enumerate(order):
+        when = [r[1] for r in runs]
+        tag = "MAJORITY" if rank == 0 else "STALE?"
+        print(f"  [{tag}] fingerprint {h}  {n_items} items  {len(runs)} runs")
+        print(f"           written {_dt.datetime.fromtimestamp(min(when)):%Y-%m-%d %H:%M}"
+              f" .. {_dt.datetime.fromtimestamp(max(when)):%Y-%m-%d %H:%M}")
+        for d, _ in sorted(runs):
+            print(f"             {d}")
+        print()
+    if len(groups) > 1:
+        print("  MORE THAN ONE EVAL SET IS PRESENT. Scores across groups are not comparable --")
+        print("  they were computed on disjoint held-out items. Delete the minority group's")
+        print("  run directories and re-run those cells; the notebooks will stop skipping them.")
+    else:
+        print("  Every run shares one eval set. Cross-arm comparisons in the tree are sound.")
+    return len(groups) == 1
+
+
 def self_test(root, n_runs=6, n_resamples=8, rng_seed=0):
     """Check `metrics_on` against sklearn and eval_run's own definitions, on real records.
 
@@ -282,11 +337,15 @@ def main():
     ap.add_argument("--out", default=None, help="JSON output (default: REPORTS_DIR/bootstrap_paired_<pair>.json)")
     ap.add_argument("--self-test", action="store_true",
                     help="verify metrics_on against sklearn on real records, then exit")
+    ap.add_argument("--audit", action="store_true",
+                    help="group every run in the tree by its eval set fingerprint, then exit")
     args = ap.parse_args()
 
     root = args.root or C.RUNS_DIR
     if args.self_test:
         sys.exit(0 if self_test(root) else 1)
+    if args.audit:
+        sys.exit(0 if audit_eval_sets(root) else 1)
     n_values = args.n_values or C.N_TRAIN_VALUES
     arm_a, arm_b = PAIRS[args.pair]
     rng = np.random.default_rng(args.rng_seed)
