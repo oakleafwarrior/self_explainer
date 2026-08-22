@@ -381,7 +381,13 @@ def main():
     # --- the sweep -------------------------------------------------------------------
     signs = {m: [] for m in METRICS}
     for n in n_values:
-        pairs, seeds = collect(root, n, arm_a, arm_b, C.seeds_for(n))
+        # Analysis reads the seeds that are ON DISK, not the grid the config intended. `seeds_for`
+        # encodes a *plan* -- and `MULTI_SEED_N` excludes 16,384 (se_config.py:113) while three seeds
+        # for it sit in the tree, so asking `seeds_for` silently dropped two of them AND, because
+        # `resample_seeds=len(pairs)>1`, gave that one N an items-only interval while every other N
+        # got items+seeds. `collect` already skips seeds it cannot find, so asking for all of them is
+        # strictly safer here and adds no GPU work.
+        pairs, seeds = collect(root, n, arm_a, arm_b, C.SEEDS)
         if not pairs:
             continue
         multi = len(pairs) > 1
