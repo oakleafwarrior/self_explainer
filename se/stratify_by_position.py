@@ -14,7 +14,10 @@ large slab of positions where nothing could be expected. That is a different fai
 This splits every comparison NB03 already ran by patch-position bucket. No training, no GPU:
 the eval split is the last `EVAL_SIZE` rows of the ready dataset in order (se_common.py:831)
 and `eval_run` appends records in that same order, so record `i` joins to dataset row
-`len(ds) - EVAL_SIZE + i` positionally. That join is asserted, not assumed.
+`len(ds) - EVAL_SIZE + i` positionally. That join is asserted rather than assumed: every arm
+and every seed has its recorded `target_text` compared against the dataset's, item by item
+(`assert_join`). A length check alone is not enough -- a run scored against a different eval
+split still has `EVAL_SIZE` records, and its bucket labels would then all be wrong.
 
 Two quantities per bucket:
 
@@ -64,6 +67,49 @@ def eval_position_labels(rotation="identity"):
     return [bucket(t) for t in tt], list(tt)
 
 
+def eval_target_texts(rotation="identity"):
+    """`target_text` for each eval item, in eval-record order.
+
+    Reconstructed exactly as `eval_run` builds it (se_common.py:879) from the same two
+    dataset columns, so it is comparable to a run's recorded targets character for character.
+    """
+    from datasets import load_from_disk
+    from se_common import build_activation_target
+
+    ds = load_from_disk(f"{C.ROTATION_DIR}/act_ready_{rotation}")
+    tail = ds.select(range(len(ds) - C.EVAL_SIZE, len(ds)))
+    return [build_activation_target("".join(o), "".join(a))
+            for o, a in zip(tail["original_continuation"], tail["ablated_continuation"])]
+
+
+def assert_join(enc, expected, n, where):
+    """The positional join is only valid if the run scored exactly these items, in order.
+
+    Item `i` of a run's records is joined to eval row `len(ds) - EVAL_SIZE + i` to get its
+    bucket. A run evaluated against a different eval split -- the split is positional and
+    moves wholesale when the dataset length changes (ACT_DATASET_PREFIX went 10,000 ->
+    20,000 partway through this project, and the filtered-probe tree is shorter again) --
+    still has EVAL_SIZE records, so a length check passes and every bucket label is then
+    silently wrong. `bootstrap_paired.py --audit` finds this across the tree; this catches
+    it for the one join actually being made here.
+    """
+    got = enc["target"]
+    if len(got) != len(expected):
+        sys.exit(f"eval records at N={n} ({where}) have {len(got)} items but the ready "
+                 f"dataset's eval split has {len(expected)}; the positional join is "
+                 "invalid. Re-run se/bootstrap_paired.py --audit.")
+    if got != expected:
+        bad = next(i for i, (g, e) in enumerate(zip(got, expected)) if g != e)
+        sys.exit(
+            f"eval records at N={n} ({where}) do not match the ready dataset's eval split: "
+            f"first difference at item {bad}.\n"
+            f"  recorded: {got[bad][:90]!r}\n"
+            f"  dataset : {expected[bad][:90]!r}\n"
+            "This run was scored against a different eval set, so its position labels would "
+            "be wrong. Re-run se/bootstrap_paired.py --audit, delete the stale run "
+            "directories, and re-evaluate them.")
+
+
 def subset(enc, keep):
     """A view of `enc` restricted to the item indices in `keep`."""
     keep = np.asarray(keep, dtype=np.int64)
@@ -85,6 +131,7 @@ def main():
     root = args.root or C.RUNS_DIR
     n_values = args.n_values or C.N_TRAIN_VALUES
     labels, raw_tt = eval_position_labels()
+    targets = eval_target_texts()
     buckets = sorted(set(labels), key=lambda b: -labels.count(b))
 
     print(f"PATCH-POSITION STRATIFICATION — metric: {args.metric}")
@@ -101,10 +148,12 @@ def main():
             pairs, seeds = collect(root, n, arm_a, arm_b, C.seeds_for(n))
             if not pairs:
                 continue
-            if len(pairs[0][0]["em"]) != len(labels):
-                sys.exit(f"eval records at N={n} have {len(pairs[0][0]['em'])} items but the "
-                         f"ready dataset's eval split has {len(labels)}; the positional join "
-                         "is invalid. Re-run se/bootstrap_paired.py --audit.")
+            # Every arm, every seed -- not just the first. `collect` already asserts the
+            # two arms of a pair agree with EACH OTHER; that is satisfied when both are
+            # stale together, which is exactly the case this has to catch.
+            for (ea, eb), s_ in zip(pairs, seeds):
+                assert_join(ea, targets, n, f"{label} / {arm_a[0]}-{arm_a[1]} / seed {s_}")
+                assert_join(eb, targets, n, f"{label} / {arm_b[0]}-{arm_b[1]} / seed {s_}")
             if not printed:
                 print(f"\nN={n}  ({len(seeds)} seed(s): {seeds})")
                 print("-" * 100)
