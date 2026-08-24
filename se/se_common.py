@@ -495,6 +495,34 @@ def check_input_map_trainability(named_parameters, capacity, d_target, d_explain
 # the no-activation floor (§4.2): the scale every result is reported against
 # ---------------------------------------------------------------------------
 
+def json_default(o):
+    """`default=` for json.dump: make numpy and pandas scalars serializable.
+
+    The pod runs pandas 3.x, where `Series.max()`, `Series.mean()` and even `.to_dict()`
+    hand back numpy scalars rather than Python ones. Any comparison built on those is an
+    `np.bool_`, and `json.dump` refuses it -- with the memorable message "Object of type
+    bool is not JSON serializable", because numpy 2 names `np.bool_.__class__` "bool".
+    A pandas-2 laptop cannot reproduce it, so this guards the write instead of the producer.
+    """
+    import numpy as _np
+
+    if isinstance(o, _np.generic):        # np.bool_, np.float64, np.int64, ...
+        return o.item()
+    if isinstance(o, _np.ndarray):
+        return o.tolist()
+    if isinstance(o, (set, frozenset)):
+        return sorted(o)
+    try:
+        import pandas as _pd
+        if o is _pd.NA or (isinstance(o, float) and o != o):
+            return None
+        if isinstance(o, _pd.Timestamp):
+            return o.isoformat()
+    except ImportError:
+        pass
+    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+
 def run_is_done(n_train, rotation, capacity, init, task="patching", seed=C.SEED,
                 explainer_model_id=C.EXPLAINER_MODEL_ID, root=None):
     """True if this cell already has a finished training run on disk.
@@ -856,6 +884,23 @@ def _warmup_kwarg(args_cls, ratio=0.03):
     return {"warmup_ratio": ratio} if "warmup_ratio" in params else {"warmup_steps": ratio}
 
 
+def _loss_type_kwarg(args_cls):
+    """Pin the SFT loss to plain `nll` on installs that offer a choice.
+
+    trl >= 0.25 defaults `loss_type` to `"chunked_nll"` and, to install it, rebinds
+    `model.forward` after reading `model.forward.__func__`. That attribute only exists on a
+    bound method, and `load_base_model` passes `device_map="auto"`, so accelerate has already
+    replaced `forward` with a `functools.partial` -> `AttributeError` before training starts.
+    `nll` is the same objective (chunking is a memory optimisation over the vocab dim, not a
+    different loss) and is what every run recorded so far was trained under, so the arms stay
+    comparable. Older trl has no `loss_type` field at all; don't invent one.
+    """
+    import inspect
+
+    params = inspect.signature(args_cls.__init__).parameters
+    return {"loss_type": "nll"} if "loss_type" in params else {}
+
+
 def make_trainer_class(placeholder_id):
     from transformers import Trainer
 
@@ -1200,6 +1245,7 @@ def run_ablation_training(n_train, tag, tokenizer, dataset, seed=C.SEED, resume=
             eval_strategy="epoch", logging_steps=5, save_strategy="no",
             report_to="none", seed=seed, data_seed=seed,
             **_warmup_kwarg(SFTConfig),
+            **_loss_type_kwarg(SFTConfig),
         ),
         peft_config=LoraConfig(
             r=C.LORA_R, lora_alpha=C.LORA_R * 2, lora_dropout=0.05,
