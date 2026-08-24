@@ -86,6 +86,33 @@ PAPER_WITH_ACTIVATION = 0.640
 PAPER_NO_ACTIVATION = 0.599       # the floor; the activation is worth ~4.1 points to them
 PAPER_SELF_CROSS_MARGIN = 0.640 - 0.541
 
+# The denominator of every normalized reading (§4.2). It is a CONSTANT, not the per-N
+# `score(Cfull, R-id) - floor` the preregistration originally specified. That per-N span is
+# an estimate with its own CI, and prereg_threshold_justification.md §1.1 showed the ratio
+# it produces is a Fieller statistic: SE(retained) ~ 0.30 at retained = 0 on a scale whose
+# decision thresholds are 0.15 and 0.35. Measured, it is worse than §1.1 predicted --
+# `mean(Cfull R-id) - floor` over the finished sweep is
+#
+#     N     256      512     1024     2048     4096     8192    16384
+#     gap  -0.0020  +0.0397  +0.0420  +0.0160  +0.0104  +0.0091  +0.0166
+#
+# with per-N seed sd of 0.008-0.025. Every one of those CIs contains zero and the N=256 span
+# is NEGATIVE, so the ratio has no finite mean, no stable sign, and no meaningful interval.
+# That is what put `retained` values of 2.59 and -0.76 in capacity_ladder_normalized.csv.
+#
+# Dividing by a constant instead makes `retained` an exact linear rescale of the raw paired
+# difference: CIs transform by the same factor, the sign is fixed, and nothing can blow up.
+# It keeps §1.1's actual recommendation -- "report the raw paired delta as primary and the
+# normalized figure as the interpretive gloss" -- while leaving every threshold in
+# reports/preregistration.json numerically untouched, because the raw-equivalent column of
+# prereg_threshold_justification.md §2 was already computed against this same 4.1 points.
+#
+# What changes: `retained` is now "fraction of the activation contribution the PAPER
+# measured", not "fraction of the gap OUR unrotated arm opened at this N". The reference arm
+# therefore no longer sits at exactly 1.0 -- where it lands is a result to report, not a
+# normalization artifact to hide.
+CONTRIBUTION_SPAN = PAPER_WITH_ACTIVATION - PAPER_NO_ACTIVATION   # 0.041
+
 # --- sweep grid --------------------------------------------------------------
 # Every point is a fresh run (see PAPER_AUDIT_PATH's note: nothing from the base repo is
 # reusable), so the grid is chosen for what the readings need rather than for overlap with

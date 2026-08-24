@@ -495,24 +495,155 @@ def check_input_map_trainability(named_parameters, capacity, d_target, d_explain
 # the no-activation floor (§4.2): the scale every result is reported against
 # ---------------------------------------------------------------------------
 
-def fraction_retained(score, floor, reference):
-    """Fraction of the activation's contribution an arm keeps.
+def fraction_retained(score, floor, *, span=C.CONTRIBUTION_SPAN):
+    """Fraction of the activation's contribution an arm keeps, on a FIXED scale.
 
         0.0   the arm is at the no-activation floor: rotation destroyed everything the
               injected vector was contributing
-        1.0   the arm matches the unrotated reference
+        1.0   the arm recovers the whole activation contribution the paper measured
+              (Table 5's `- activation` ablation, 4.1 exact-match points)
         < 0   worse than passing no activation at all — a bug, or the rotated vector is
               actively misleading the explainer (§9)
 
     Rotation can only destroy the *value of v*; it cannot touch what the explainer gets
-    from the prompt text. The paper's own `- activation` ablation bounds that value at ~4
-    exact-match points, so raw score differences understate the effect by roughly 15x and
-    are not the scale the readings should be stated on (§4.2).
+    from the prompt text. The paper's ablation bounds that value at ~4 exact-match points,
+    so raw score differences understate the effect by roughly 15x and are not the scale the
+    readings should be stated on (§4.2).
+
+    `span` is `C.CONTRIBUTION_SPAN`, a constant. It is deliberately NOT the per-N
+    `reference - floor` this function divided by before 2026-08-24: that quantity's own 95%
+    CI contains zero at every N in the sweep and is negative at N=256, which makes the ratio
+    a Fieller statistic with no finite mean (see the CONTRIBUTION_SPAN comment in
+    se_config.py, and prereg_threshold_justification.md §1.1). With a constant denominator
+    this is an exact linear rescale of `score - floor`, so a CI on the raw difference maps
+    to a CI here by dividing by the same number.
+
+    1.0 is therefore no longer "our unrotated arm at this N". Where that arm lands on this
+    scale is a measurement, and NB03/NB07 report it as one.
+
+    `span` is keyword-only on purpose. The old signature took `reference` third and
+    positionally, so a stale `fraction_retained(v, floor, ref)` raises TypeError here
+    instead of silently dividing a 4-point effect by a ~0.7 accuracy.
     """
-    span = reference - floor
-    if span == 0:
+    if not span or span != span:
         return float("nan")
+    if not 0 < span < 0.25:
+        raise ValueError(
+            f"span={span!r} is not a plausible activation contribution. This is almost "
+            f"certainly a per-N `reference - floor` (or a raw accuracy) reaching a "
+            f"parameter that now expects a constant. Pass C.CONTRIBUTION_SPAN, or see "
+            f"se_config.CONTRIBUTION_SPAN for why the per-N span was retired."
+        )
     return (score - floor) / span
+
+
+# 95% two-sided t quantiles. Seed counts here are 3 per arm, so the normal 1.96 understates
+# every interval; df is small enough that the difference matters (t(4) = 2.78).
+_T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306,
+        9: 2.262, 10: 2.228, 12: 2.179, 14: 2.145, 16: 2.120, 20: 2.086, 24: 2.064,
+        30: 2.042, 40: 2.021, 60: 2.000}
+
+
+def t_crit_95(df):
+    """Two-sided 95% t quantile, rounded up to the nearest tabulated df (conservative)."""
+    if df < 1:
+        return float("inf")
+    for k in sorted(_T95):
+        if df <= k:
+            return _T95[k]
+    return 1.96
+
+
+def closure_with_ci(rand, full, ridge):
+    """The rank-artifact closure, with the check that its denominator is real.
+
+        closure = (score(P-rand-full) - score(P-rand)) / (score(P-ridge) - score(P-rand))
+
+    NB05 §5 and NB07 both read this, so it lives here rather than in either of them.
+
+    **Why this is not a division.** The denominator is a difference of two measured arms, so
+    it carries its own seed noise. `fraction_retained` used to have exactly this shape and it
+    produced values of +2.59 and -13.67 once the denominator's own CI covered zero (see
+    se_config.CONTRIBUTION_SPAN). There the fix was to divide by a constant; here there is no
+    constant available, because the `P-rand -> P-ridge` gap is the quantity of interest. So
+    the ratio has to be reported as a ratio — which means Fieller, not a point estimate.
+
+    Numerator and denominator SHARE `rand`, so they are positively correlated:
+    cov = var(mean(rand)). Ignoring that would misstate the interval in both directions.
+
+    Fieller inverts the pivot (a - rho*b) / sqrt(v11 - 2 rho v12 + rho^2 v22) ~ t, giving the
+    quadratic (b^2 - t^2 v22) rho^2 - 2(ab - t^2 v12) rho + (a^2 - t^2 v11) = 0. Its leading
+    coefficient A is positive exactly when |b| / se(b) > t, i.e. exactly when the gap's own CI
+    excludes zero. So "is the denominator resolvable" and "does Fieller give a bounded
+    interval" are the same question, and `gap_resolvable` below reports it once.
+
+    Args:
+        rand, full, ridge: per-seed score sequences for P-rand, P-rand-full, P-ridge. Pass
+            every seed, not a mean -- the spread is the point.
+
+    Returns a dict. `closure` is None when the gap is not resolvable: a point estimate whose
+    denominator could be zero is not a number to put in a table, and the honest report is the
+    raw `full - rand` difference alongside the unresolvable gap.
+    """
+    import numpy as _np
+
+    def arm(xs):
+        a = _np.asarray([x for x in xs if x is not None], dtype=float)
+        k = len(a)
+        return {"mean": float(a.mean()) if k else None,
+                "sd": float(a.std(ddof=1)) if k > 1 else None,
+                "band": float(a.max() - a.min()) if k else None,
+                "var_mean": float(a.var(ddof=1) / k) if k > 1 else None,
+                "n_seeds": k}
+
+    R, F, G = arm(rand), arm(full), arm(ridge)
+    out = {"P-rand": R, "P-rand-full": F, "P-ridge": G}
+
+    if None in (R["mean"], F["mean"], G["mean"]):
+        return {**out, "gap": None, "gap_resolvable": False, "closure": None,
+                "note": "an arm is missing"}
+
+    a = F["mean"] - R["mean"]                 # numerator
+    b = G["mean"] - R["mean"]                 # denominator: the P-rand -> P-ridge gap
+    out["numerator"], out["gap"] = a, b
+
+    if None in (R["var_mean"], F["var_mean"], G["var_mean"]):
+        return {**out, "gap_resolvable": False, "closure": None,
+                "note": "single seed on at least one arm -- the gap has no measured spread, "
+                        "so the ratio cannot be checked. Run C.seeds_for(n) on all three."}
+
+    v11 = F["var_mean"] + R["var_mean"]       # var(numerator)
+    v22 = G["var_mean"] + R["var_mean"]       # var(denominator)
+    v12 = R["var_mean"]                       # cov: both differences contain `rand`
+    df = sum(x["n_seeds"] - 1 for x in (R, F, G))
+    t = t_crit_95(df)
+
+    se_gap = v22 ** 0.5
+    out.update({"gap_se": se_gap, "df": df, "t_crit": t,
+                "gap_ci95": [b - t * se_gap, b + t * se_gap],
+                "seed_band_max": max(x["band"] for x in (R, F, G))})
+
+    A = b * b - t * t * v22
+    out["gap_resolvable"] = bool(A > 0)
+    if A <= 0:
+        return {**out, "closure": None,
+                "note": (f"the P-rand -> P-ridge gap is {b:+.4f} with se {se_gap:.4f} "
+                         f"(t{df} CI [{out['gap_ci95'][0]:+.4f}, {out['gap_ci95'][1]:+.4f}], "
+                         f"which includes 0). Closure is undefined: report the raw "
+                         f"P-rand-full - P-rand difference of {a:+.4f} instead, and say the "
+                         f"gap it would normalize could not be measured apart from zero.")}
+
+    B = a * b - t * t * v12
+    Cq = a * a - t * t * v11
+    disc = B * B - A * Cq
+    if disc < 0:
+        return {**out, "closure": a / b, "closure_ci95": None,
+                "note": "Fieller discriminant < 0: no bounded solution despite a resolvable "
+                        "gap. Report the point estimate as indicative only."}
+    root = disc ** 0.5
+    return {**out, "closure": a / b,
+            "closure_ci95": sorted([(B - root) / A, (B + root) / A]),
+            "note": ""}
 
 
 def paired_delta(records_a, records_b, key="exact_match"):
