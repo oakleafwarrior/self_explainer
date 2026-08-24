@@ -495,6 +495,59 @@ def check_input_map_trainability(named_parameters, capacity, d_target, d_explain
 # the no-activation floor (§4.2): the scale every result is reported against
 # ---------------------------------------------------------------------------
 
+def run_is_done(n_train, rotation, capacity, init, task="patching", seed=C.SEED,
+                explainer_model_id=C.EXPLAINER_MODEL_ID, root=None):
+    """True if this cell already has a finished training run on disk.
+
+    Same existence test `run_training(resume=True)` uses to decide whether to skip, so a
+    plan built from this cannot disagree with what the loop then does.
+    """
+    save_dir = C.run_dir(task, rotation, capacity, init, n_train,
+                         explainer=explainer_model_id, seed=seed, root=root)
+    return os.path.exists(f"{save_dir}/metrics.json")
+
+
+def plan_runs(cells, label="", hours_per_run=1.5, root=None):
+    """Price a training loop BEFORE it starts, and say exactly what is missing.
+
+    Every sweep cell in this project is a `for n / for seed / for arm` loop over
+    `C.seeds_for`, which encodes the grid the config *intends*. When that config changes,
+    the loops silently widen: flipping MULTI_SEED_N to every N on 2026-08-24 made them ask
+    for 18 new runs at N=16,384 (~27 h) that no reading consumes. `resume=True` protects
+    finished work but does nothing about work that was never meant to start.
+
+    `cells` is a list of kwargs dicts, each identifying one run the way `run_training` does
+    (n_train, rotation, capacity, init, and optionally task/seed/explainer_model_id).
+
+    Returns {"done": [...], "missing": [...]} and prints the bill. Gate the loop on
+    `missing` -- an empty list means the cell is a pure re-read and costs nothing.
+    """
+    done, missing = [], []
+    for cell in cells:
+        (done if run_is_done(root=root, **cell) else missing).append(cell)
+
+    head = f"PLAN — {label}" if label else "PLAN"
+    print(head)
+    print("=" * max(len(head), 66))
+    print(f"  {len(done)} already on disk (resume will skip), {len(missing)} to train")
+    if missing:
+        by_n = {}
+        for c in missing:
+            by_n.setdefault(c["n_train"], []).append(c)
+        print(f"  estimated {len(missing) * hours_per_run:.1f} h at {hours_per_run} h/run\n")
+        for n in sorted(by_n, key=lambda x: (x is None, x)):
+            rows = by_n[n]
+            print(f"  N = {n}  ({len(rows)} run(s), ~{len(rows) * hours_per_run:.1f} h)")
+            for c in sorted(rows, key=lambda d: (d["capacity"], d["rotation"], d.get("seed", 0))):
+                print(f"      {c['capacity']:<11} {c['init']:<11} {c['rotation']:<9} "
+                      f"seed {c.get('seed', C.SEED)}")
+        print("\n  Nothing above is trained unless the loop below is enabled. If a row here "
+              "is\n  a surprise, fix the seed policy (C.seeds_for_arm) before running it.")
+    else:
+        print("  nothing to train — this cell is a re-read")
+    return {"done": done, "missing": missing}
+
+
 def fraction_retained(score, floor, *, span=C.CONTRIBUTION_SPAN):
     """Fraction of the activation's contribution an arm keeps, on a FIXED scale.
 

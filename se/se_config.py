@@ -252,6 +252,36 @@ def seeds_for(n_train):
     return list(SEEDS) if n_train in MULTI_SEED_N else [SEED]
 
 
+# Which arms were actually replicated at the TOP N. `MULTI_SEED_N` says which N *could*
+# carry a seed band; this says which arms were paid for at max(N_TRAIN_VALUES).
+#
+# 2026-08-24: MULTI_SEED_N went from N_TRAIN_VALUES[:-1] to N_TRAIN_VALUES, because three
+# seeds really do sit in the tree at 16,384 -- but only for Cfull under R-id and R-Q, which
+# were run by hand to defend the lift anomaly at that N. `seeds_for` cannot tell those apart
+# from the other eight arms, so every training loop keyed on it silently began asking for 18
+# new runs at 16,384 (~27 h): the floor, C0 x 2 rotations, C8/C128/C512/Oracle, and
+# Cfull-rand x 2 rotations. Nothing reads any of them as a 3-seed quantity, because the rest
+# of the capacity ladder is single-seed at that N regardless.
+#
+# Add a pair here only when its third seed is actually on disk.
+SEED_REPLICATED_AT_MAX_N = {("Cfull", "identity"), ("Cfull", "Q")}
+
+
+def seeds_for_arm(n_train, capacity, rotation):
+    """`seeds_for`, but honest about which arms were replicated at the top N.
+
+    Below max(N_TRAIN_VALUES) this is exactly `seeds_for`. At the top N it returns the full
+    seed list only for arms in SEED_REPLICATED_AT_MAX_N and a single seed otherwise, so a
+    training loop asks for what exists rather than for what the grid would imply.
+
+    `rotation` matters: the no-activation floor is (capacity="Cfull", rotation="zerovec")
+    and is NOT replicated at the top N, so keying on capacity alone would get it wrong.
+    """
+    if n_train != max(N_TRAIN_VALUES):
+        return seeds_for(n_train)
+    return list(SEEDS) if (capacity, rotation) in SEED_REPLICATED_AT_MAX_N else [SEED]
+
+
 def describe_arm(rotation, capacity, init):
     """Human-readable arm label used in figure legends."""
     return f"{rotation} · {capacity} · init={init}"
