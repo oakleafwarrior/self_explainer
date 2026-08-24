@@ -110,7 +110,7 @@ N_TRAIN_LADDER = [512, 2048, 16384]     # capacity ladder and secondary-arm N va
 # Cost: NB03 goes 52 -> 96 runs (1.8x) and 169k -> 247k training examples (1.46x). Paid for
 # out of the v2 §8 cut list, in its stated order.
 SEEDS = [67, 68, 69]
-MULTI_SEED_N = list(N_TRAIN_VALUES[:-1])      # every N is a multi-seed N now
+MULTI_SEED_N = list(N_TRAIN_VALUES)      # every N is a multi-seed N now
 
 # --- training hyperparameters (must match the base repo for the control to be valid) ---
 
