@@ -14,3 +14,4 @@ __pycache__/
 
 /notebooks/claude_unchecked/
 .claude/
+/drafts/
